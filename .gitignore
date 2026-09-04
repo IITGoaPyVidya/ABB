@@ -8,4 +8,4 @@ dist/
 .angular/
 .pytest_cache/
 .env
-.github
+.github/agents
