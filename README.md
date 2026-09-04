@@ -71,7 +71,9 @@ npm run build
 
 Register a model and version, advance it through `VALIDATED` and `APPROVED`, request production deployment with `X-Idempotency-Key`, inspect events and metrics, then retry a simulated failure or roll back a successful production deployment.
 
-See [architecture](src/documentation/architecture.md), [API reference](src/documentation/api.md), and [test strategy](src/documentation/test-strategy.md). Sample data and the initial API contract remain in `artifacts/`.
+See [architecture](docs/architecture.md), [API reference](docs/api-design.md), and [test strategy](docs/test-strategy.md). Sample data and the initial API contract remain in `artifacts/`.
+
+The recommended submission documentation is mirrored under `docs/`; the implementation remains under `src/backend` and `src/frontend`.
 
 The architecture diagram is maintained as Mermaid source in the architecture document. No screenshots are claimed here; capture them from the seeded local or Docker UI as submission evidence.
 
