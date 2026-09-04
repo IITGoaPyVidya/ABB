@@ -49,3 +49,26 @@ def test_invalid_lifecycle_transition_is_rejected(client):
     response = client.post("/models/demo-model/versions/1.0.0/lifecycle", json={"stage": "PRODUCTION"})
     assert response.status_code == 409
     assert response.json()["detail"]["code"] == "INVALID_LIFECYCLE_TRANSITION"
+
+
+def test_version_comparison_and_idempotency_conflict(client):
+    register(client)
+    assert client.post("/models/demo-model/versions", json={"version": "2.0.0", "artifact_uri": "file:///model-v2"}).status_code == 201
+    comparison = client.get("/models/demo-model/versions/compare?left=1.0.0&right=2.0.0")
+    assert comparison.status_code == 200
+    assert comparison.json()["right"]["artifact_uri"] == "file:///model-v2"
+
+    first = client.post("/deployments", headers={"X-Idempotency-Key": "same-key"}, json={"model_id": "demo-model", "version": "1.0.0", "environment": "staging"})
+    conflict = client.post("/deployments", headers={"X-Idempotency-Key": "same-key"}, json={"model_id": "demo-model", "version": "2.0.0", "environment": "staging"})
+    assert first.status_code == 202
+    assert conflict.status_code == 409
+    assert conflict.json()["detail"]["code"] == "IDEMPOTENCY_CONFLICT"
+
+
+def test_metrics_expose_monitoring_summary_fields(client):
+    register(client)
+    with api.store.connect() as db:
+        db.execute("INSERT INTO metrics (model_id, version, environment, timestamp, latency_ms, throughput_rpm, error_rate, quality_score, drift_score, availability) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", ("demo-model", "1.0.0", "staging", "2026-01-01T00:00:00Z", 10, 20, 0.01, 0.9, 0.1, 99.9))
+    metrics = client.get("/models/demo-model/metrics").json()
+    assert metrics[0]["last_successful_inference"] == "2026-01-01T00:00:00Z"
+    assert metrics[0]["monitoring_status"] == "HEALTHY"

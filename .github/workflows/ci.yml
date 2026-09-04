@@ -7,7 +7,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: {python-version: '3.11'}
-      - run: pip install -r src/backend/requirements.txt
+      - run: pip install -r src/backend/requirements.txt ruff
+      - run: ruff check src/backend src/tests
       - run: python -m py_compile src/backend/app.py
       - run: pytest src/tests -q
   frontend:
@@ -19,4 +20,6 @@ jobs:
       - run: npm ci
         working-directory: src/frontend
       - run: npm run build
+        working-directory: src/frontend
+      - run: npm test -- --watch=false
         working-directory: src/frontend

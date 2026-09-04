@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sqlite3
 import uuid
@@ -10,9 +11,10 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, Header, HTTPException, Query, status
+from fastapi import FastAPI, Header, HTTPException, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict, Field
+from fastapi.exceptions import RequestValidationError
 
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./mlops.db")
@@ -21,6 +23,19 @@ LOCAL_ARTIFACTS_PATH = Path(__file__).resolve().parent / "artifacts"
 if not LOCAL_ARTIFACTS_PATH.exists() and len(Path(__file__).resolve().parents) > 2:
     LOCAL_ARTIFACTS_PATH = Path(__file__).resolve().parents[2] / "artifacts"
 ARTIFACTS_PATH = Path(os.getenv("ARTIFACTS_PATH", str(LOCAL_ARTIFACTS_PATH)))
+
+
+class JsonFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        return json.dumps({"level": record.levelname, "event": record.getMessage(), "logger": record.name})
+
+
+logger = logging.getLogger("mlops")
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(JsonFormatter())
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
 
 
 class Lifecycle(str, Enum):
@@ -147,6 +162,7 @@ def now() -> str:
 
 
 def error(code: str, message: str, http_status: int) -> HTTPException:
+    logger.warning("api_error code=%s status=%s message=%s", code, http_status, message)
     return HTTPException(http_status, detail={"code": code, "message": message})
 
 
@@ -181,6 +197,11 @@ app = FastAPI(title="MLOps Platform", version="1.0.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
+@app.exception_handler(RequestValidationError)
+async def validation_error(_: Request, exception: RequestValidationError) -> dict[str, Any]:
+    return {"detail": {"code": "VALIDATION_ERROR", "message": "Request validation failed", "fields": exception.errors()}}
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok", "database": "sqlite"}
@@ -192,6 +213,7 @@ def create_model(payload: ModelCreate) -> dict[str, Any]:
     try:
         with store.connect() as db:
             db.execute("INSERT INTO models VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", (payload.model_id, payload.name, payload.owner, payload.framework, payload.algorithm, json.dumps(payload.tags), json.dumps(payload.metadata), timestamp, timestamp))
+            logger.info("model_registered model_id=%s", payload.model_id)
             return {**payload.model_dump(), "created_at": timestamp, "updated_at": timestamp, "versions": []}
     except sqlite3.IntegrityError:
         raise error("MODEL_EXISTS", "Model ID already exists", 409)
@@ -229,6 +251,7 @@ def create_version(model_id: str, payload: VersionCreate) -> dict[str, Any]:
             if not db.execute("SELECT 1 FROM models WHERE model_id = ?", (model_id,)).fetchone():
                 raise error("MODEL_NOT_FOUND", "Model was not found", 404)
             db.execute("INSERT INTO versions VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (model_id, payload.version, payload.artifact_uri, payload.training_data_ref, Lifecycle.DRAFT, 0, timestamp, timestamp))
+            logger.info("version_registered model_id=%s version=%s", model_id, payload.version)
             return {"model_id": model_id, **payload.model_dump(), "stage": Lifecycle.DRAFT, "approved": False, "created_at": timestamp, "updated_at": timestamp}
     except sqlite3.IntegrityError:
         raise error("VERSION_EXISTS", "Model version already exists", 409)
@@ -240,6 +263,16 @@ def list_versions(model_id: str) -> list[dict[str, Any]]:
         if not db.execute("SELECT 1 FROM models WHERE model_id = ?", (model_id,)).fetchone():
             raise error("MODEL_NOT_FOUND", "Model was not found", 404)
         return [version_dict(row) for row in db.execute("SELECT * FROM versions WHERE model_id = ? ORDER BY version", (model_id,)).fetchall()]
+
+
+@app.get("/models/{model_id}/versions/compare")
+def compare_versions(model_id: str, left: str = Query(...), right: str = Query(...)) -> dict[str, Any]:
+    with store.connect() as db:
+        if not db.execute("SELECT 1 FROM models WHERE model_id = ?", (model_id,)).fetchone():
+            raise error("MODEL_NOT_FOUND", "Model was not found", 404)
+        left_version = get_version(db, model_id, left)
+        right_version = get_version(db, model_id, right)
+        return {"model_id": model_id, "left": version_dict(left_version), "right": version_dict(right_version), "same_artifact": left_version["artifact_uri"] == right_version["artifact_uri"]}
 
 
 @app.post("/models/{model_id}/versions/{version}/lifecycle")
@@ -261,6 +294,9 @@ def create_deployment(payload: DeploymentCreate, x_idempotency_key: str | None =
         if x_idempotency_key:
             existing = db.execute("SELECT * FROM deployments WHERE idempotency_key = ?", (x_idempotency_key,)).fetchone()
             if existing:
+                if any((existing[field] != getattr(payload, field)) for field in ("model_id", "version", "environment", "simulate_failure")):
+                    logger.warning("idempotency_conflict key=%s", x_idempotency_key)
+                    raise error("IDEMPOTENCY_CONFLICT", "Idempotency key was already used with a different payload", 409)
                 return deployment_response(db, existing)
         version = get_version(db, payload.model_id, payload.version)
         if payload.environment == "production" and (not version["approved"] or version["stage"] not in {Lifecycle.APPROVED, Lifecycle.STAGING, Lifecycle.PRODUCTION}):
@@ -269,6 +305,7 @@ def create_deployment(payload: DeploymentCreate, x_idempotency_key: str | None =
         deployment_status = DeploymentStatus.FAILED if payload.simulate_failure else DeploymentStatus.SUCCEEDED
         db.execute("INSERT INTO deployments VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", (deployment_id, payload.model_id, payload.version, payload.environment, deployment_status, int(payload.simulate_failure), x_idempotency_key, timestamp, timestamp))
         log_event(db, deployment_id, "deployment_failed" if payload.simulate_failure else "deployment_completed", deployment_status)
+        logger.info("deployment_requested deployment_id=%s model_id=%s version=%s status=%s", deployment_id, payload.model_id, payload.version, deployment_status)
         return deployment_response(db, db.execute("SELECT * FROM deployments WHERE deployment_id = ?", (deployment_id,)).fetchone())
 
 
@@ -306,6 +343,7 @@ def retry_deployment(deployment_id: str) -> dict[str, Any]:
         timestamp = now()
         db.execute("UPDATE deployments SET status = ?, simulate_failure = 0, updated_at = ? WHERE deployment_id = ?", (DeploymentStatus.SUCCEEDED, timestamp, deployment_id))
         log_event(db, deployment_id, "deployment_retried", DeploymentStatus.SUCCEEDED)
+        logger.info("deployment_retried deployment_id=%s", deployment_id)
         return deployment_response(db, db.execute("SELECT * FROM deployments WHERE deployment_id = ?", (deployment_id,)).fetchone())
 
 
@@ -319,6 +357,7 @@ def rollback_deployment(deployment_id: str) -> dict[str, Any]:
             raise error("INVALID_DEPLOYMENT_STATE", "Only successful production deployments can be rolled back", 409)
         db.execute("UPDATE deployments SET status = ?, updated_at = ? WHERE deployment_id = ?", (DeploymentStatus.ROLLED_BACK, now(), deployment_id))
         log_event(db, deployment_id, "deployment_rolled_back", DeploymentStatus.ROLLED_BACK)
+        logger.info("deployment_rolled_back deployment_id=%s", deployment_id)
         return deployment_response(db, db.execute("SELECT * FROM deployments WHERE deployment_id = ?", (deployment_id,)).fetchone())
 
 
@@ -326,4 +365,10 @@ def rollback_deployment(deployment_id: str) -> dict[str, Any]:
 def model_metrics(model_id: str, version: str | None = None, environment: str | None = None) -> list[dict[str, Any]]:
     with store.connect() as db:
         rows = db.execute("SELECT * FROM metrics WHERE model_id = ? AND (? IS NULL OR version = ?) AND (? IS NULL OR environment = ?) ORDER BY timestamp DESC", (model_id, version, version, environment, environment)).fetchall()
-        return [dict(row) for row in rows]
+        result = []
+        for row in rows:
+            metric = dict(row)
+            metric["last_successful_inference"] = metric["timestamp"]
+            metric["monitoring_status"] = "HEALTHY" if metric["error_rate"] <= 0.02 and metric["drift_score"] <= 0.2 and metric["availability"] >= 99 else "DEGRADED"
+            result.append(metric)
+        return result
