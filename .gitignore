@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.db
+.venv/
+mlops_env/
+node_modules/
+dist/
+.angular/
+.pytest_cache/
+.env

@@ -1,0 +1,25 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: src/backend/Dockerfile
+    environment:
+      DATABASE_URL: sqlite:////data/mlops.db
+      SEED_DATA: "true"
+    ports: ["8000:8000"]
+    volumes: ["mlops-data:/data"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+  frontend:
+    build:
+      context: .
+      dockerfile: src/frontend/Dockerfile
+    ports: ["4200:80"]
+    depends_on:
+      backend:
+        condition: service_healthy
+volumes:
+  mlops-data:
